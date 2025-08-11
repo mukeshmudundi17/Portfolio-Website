@@ -1,0 +1,99 @@
+name: Performance Check
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  COMPOSE_PROJECT_NAME: ci        # fixed compose project name -> network: ci_default
+  K6_SUMMARY: k6-summary.json
+
+jobs:
+  perf:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Docker versions
+        run: |
+          docker --version
+          docker compose version
+
+      - name: Build & start services
+        run: |
+          docker compose up --build -d service1 service2 toxiproxy prometheus
+          docker compose ps
+
+      - name: Wait for service1 & service2 to be healthy
+        run: |
+          for i in {1..60}; do
+            (curl -sf http://localhost:8000/ping >/dev/null) && echo "service1 OK" && break || true
+            sleep 2
+          done
+          for i in {1..60}; do
+            (curl -sf http://localhost:8001/ping >/dev/null) && echo "service2 OK" && break || true
+            sleep 2
+          done
+
+      - name: Create toxiproxy proxies (svc1=9000, svc2=9100)
+        run: |
+          curl -sS -X POST http://localhost:8474/proxies \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"svc1","listen":"0.0.0.0:9000","upstream":"service1:8000"}' || true
+          curl -sS -X POST http://localhost:8474/proxies \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"svc2","listen":"0.0.0.0:9100","upstream":"service2:8001"}' || true
+          curl -s http://localhost:8474/proxies
+
+      # Optional: mild chaos (uncomment to test resilience in CI)
+      # - name: Enable mild chaos on svc2
+      #   run: |
+      #     curl -sS -X POST http://localhost:8474/proxies/svc2/toxics \
+      #       -H 'Content-Type: application/json' \
+      #       -d '{"name":"latency","type":"latency","stream":"downstream","attributes":{"latency":150,"jitter":50}}' || true
+
+      - name: Run k6 (via Docker) against service1 through toxiproxy
+        run: |
+          docker run --rm \
+            --network ${COMPOSE_PROJECT_NAME}_default \
+            -e BASE=http://toxiproxy:9000 \
+            -v "$PWD/scripts:/scripts" \
+            -v "$PWD:/work" \
+            grafana/k6:latest run \
+            --summary-export=/work/${K6_SUMMARY} \
+            /scripts/k6_ci.js
+
+      - name: Upload k6 summary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-summary
+          path: ${{ env.K6_SUMMARY }}
+
+      - name: Show compose status
+        if: always()
+        run: docker compose ps
+
+      - name: Collect container logs (on failure too)
+        if: always()
+        run: |
+          mkdir -p logs
+          docker compose logs --no-color > logs/compose.log || true
+          ls -lh logs || true
+
+      - name: Upload logs artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-logs
+          path: logs/
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
